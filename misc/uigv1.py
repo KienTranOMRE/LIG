@@ -1,0 +1,696 @@
+"""
+Adaptive Path IG — v7
+======================
+Unified framework generalizing IG, IDGI, and Guided IG.
+
+Objective: find the path γ where uniform sampling achieves
+completeness with the fewest samples — equivalently, minimize
+the roughness of the attribution density g(α) = ∇f(γ(α))·γ'(α).
+
+Strategy: iterative adaptive reparametrization.
+  - Where g is large (spike): slow down γ' → spread the spike
+  - Where g is small (flat): speed up γ' → waste fewer samples
+  - Target: g(αᵢ) ≈ Δf/N for all i (uniform density)
+
+Special cases:
+  - 0 iterations: vanilla IG
+  - Output-based scaling on straight line: ≈ IDGI
+  - Per-dimension velocity adjustment: ≈ Guided IG
+  - Full optimization: the unified optimum
+
+Requirements: pip install torch torchvision numpy matplotlib
+"""
+
+import time
+import torch
+import torch.nn.functional as F
+from dataclasses import dataclass
+
+
+# =============================================================================
+# 1. MODEL GRADIENT UTILITIES
+# =============================================================================
+
+def model_grad(model_f, z, target_class):
+    """∇_z f(z) — single point, detached."""
+    z_leaf = z.detach().requires_grad_(True)
+    logits = model_f(z_leaf)
+    f_val = logits[:, target_class]
+    g = torch.autograd.grad(f_val.sum(), z_leaf, create_graph=False)[0]
+    return g.detach(), f_val.detach()
+
+
+def model_grads_batched(model_f, points, target_class, chunk=8):
+    """Batched ∇f at multiple points, detached."""
+    if isinstance(points, list):
+        points = torch.stack(points, 0)
+    M, B, C, H, W = points.shape
+    out = torch.empty_like(points)
+    for s in range(0, M, chunk):
+        e = min(s + chunk, M)
+        flat = points[s:e].reshape((e-s)*B, C, H, W).detach().requires_grad_(True)
+        logits = model_f(flat)
+        g = torch.autograd.grad(logits[:, target_class].sum(), flat)[0]
+        out[s:e] = g.reshape(e-s, B, C, H, W)
+    return out.detach()
+
+
+# =============================================================================
+# 2. VANILLA IG
+# =============================================================================
+
+def compute_vanilla_ig(model_f, x, x_prime, target_class, N=50, chunk=16):
+    """Standard IG: straight line, uniform sampling."""
+    device = x.device
+    direction = x - x_prime
+    alphas = torch.linspace(1/N, 1.0, N, device=device)
+    waypoints = torch.stack([x_prime + a * direction for a in alphas], 0)
+    grads = model_grads_batched(model_f, waypoints, target_class, chunk=chunk)
+    attr = grads.mean(0) * direction
+
+    densities = []
+    for i in range(N):
+        d = (grads[i] * direction).flatten(1).sum(1)
+        densities.append(d.item())
+
+    path = [x_prime + (i/N) * direction for i in range(N + 1)]
+    return attr, densities, path
+
+
+# =============================================================================
+# 3. IDGI
+# =============================================================================
+
+def compute_idgi(model_f, x, x_prime, target_class, N=50, chunk=16):
+    """
+    IDGI: importance sampling on the straight-line path.
+    Weight each step by |Δf| — the actual output change.
+    Normalizes gradients to unit vectors, scales by Δf for completeness.
+    """
+    device = x.device
+    B = x.shape[0]
+    direction = x - x_prime
+    alphas = torch.linspace(0, 1.0, N + 1, device=device)
+
+    logit_vals = []
+    with torch.no_grad():
+        for a in alphas:
+            z = x_prime + a * direction
+            logit_vals.append(model_f(z)[:, target_class])
+
+    delta_f = logit_vals[-1] - logit_vals[0]
+
+    weights = []
+    for i in range(1, N + 1):
+        weights.append((logit_vals[i] - logit_vals[i-1]).abs())
+    w_stack = torch.stack(weights, 0)
+    w_sum = w_stack.sum(0, keepdim=True).clamp(min=1e-8)
+    w_norm = w_stack / w_sum
+
+    step_alphas = torch.linspace(1/N, 1.0, N, device=device)
+    waypoints = torch.stack([x_prime + a * direction for a in step_alphas], 0)
+    grads = model_grads_batched(model_f, waypoints, target_class, chunk=chunk)
+
+    g_flat = grads.reshape(N, B, -1)
+    g_norm = g_flat.norm(dim=2, keepdim=True).clamp(min=1e-10)
+    g_unit = g_flat / g_norm
+
+    w_exp = w_norm.unsqueeze(-1)
+    weighted = (w_exp * g_unit).sum(dim=0)
+
+    d_sum = weighted.sum(dim=1, keepdim=True).clamp(min=1e-10)
+    attr = (delta_f.unsqueeze(-1) * weighted / d_sum).view_as(x)
+
+    densities = []
+    for i in range(N):
+        d_flat = delta_f.unsqueeze(-1) * w_exp[i] * g_unit[i] / d_sum
+        densities.append(d_flat.sum(1).item())
+
+    path = [x_prime + a * direction for a in alphas]
+    return attr, densities, path
+
+
+# =============================================================================
+# 4. GUIDED IG
+# =============================================================================
+
+def compute_guided_ig(model_f, x, x_prime, target_class, N=50):
+    """
+    Guided IG: rank-based inverse weighting.
+
+    At each step:
+      1. Score each dim: |∇f_j| × |remaining_j|
+      2. Rank dims by score (1 = smallest = least important)
+      3. Weight = 1/rank (low-score dims get big steps, high-score get small)
+      4. Normalize weights so average = 1
+      5. All dims advance: step_j = weight_j × remaining_j / N
+
+    Rank-based weighting is bounded (max weight = D, min = 1) and doesn't
+    explode near zero gradient. The logit profile should be flat early
+    (low-importance dims fill in) and jump late (high-importance dims arrive).
+    """
+    device = x.device
+    B = x.shape[0]
+
+    z = x_prime.clone()
+    attr = torch.zeros_like(x)
+    waypoints = [z.clone()]
+    densities = []
+
+    for i in range(N):
+        grad_f, _ = model_grad(model_f, z, target_class)
+        remaining = x - z
+
+        rem_flat = remaining.flatten(1)       # (B, D)
+        grad_flat = grad_f.abs().flatten(1)   # (B, D)
+        D = rem_flat.shape[1]
+
+        # Score: |∇f| × |remaining|
+        score = grad_flat * rem_flat.abs()    # (B, D)
+
+        # Rank: 1 = smallest score, D = largest score
+        # argsort gives indices that would sort ascending
+        # rank[j] = position of dim j in the sorted order
+        ranks = score.argsort(dim=1).argsort(dim=1).float() + 1  # (B, D), range [1, D]
+
+        # Inverse rank weighting: low rank (small score) → large weight
+        weights = 1.0 / ranks  # (B, D), range [1/D, 1]
+
+        # Normalize so mean weight = 1
+        weights = weights / weights.mean(dim=1, keepdim=True)
+
+        # Step: each dim advances proportional to weight × remaining / N
+        step_flat = (1.0 / N) * weights * rem_flat
+        step = step_flat.view_as(z)
+
+        attr += grad_f * step
+        d = (grad_f * step).flatten(1).sum(1)
+        densities.append(d.item())
+
+        z = z + step
+        waypoints.append(z.clone())
+
+    return attr, waypoints, densities
+
+    return attr, waypoints, densities
+
+
+# =============================================================================
+# 5. ADAPTIVE PATH IG (the unified method)
+# =============================================================================
+
+@dataclass
+class AdaptiveConfig:
+    n_iters: int = 10          # number of smoothing iterations
+    clamp_lo: float = 0.1      # minimum velocity scale factor
+    clamp_hi: float = 10.0     # maximum velocity scale factor
+    momentum: float = 0.5      # blend with previous velocity
+    log_every: int = 1
+
+
+def adaptive_path_ig(model_f, x, x_prime, target_class, N=50,
+                     cfg=AdaptiveConfig(), chunk=16):
+    """
+    Adaptive Path IG: iteratively reparametrize the path so that
+    the attribution density g(α) = ∇f·γ' is approximately uniform.
+
+    At each iteration:
+      1. Compute gᵢ = ∇f(γᵢ)·γ'ᵢ at each step
+      2. Scale velocity: γ'ᵢ *= (Δf/N) / gᵢ  (clamped)
+      3. Correct endpoint: redistribute displacement error
+      4. Reintegrate path
+
+    After convergence, gᵢ ≈ Δf/N for all i → uniform density
+    → fewest uniform samples needed → smoothest attribution profile.
+
+    Cost: n_iters × N gradient evaluations ≈ 10× vanilla IG.
+    """
+    device = x.device
+    B = x.shape[0]
+
+    with torch.no_grad():
+        f_x = model_f(x)[:, target_class].item()
+        f_xp = model_f(x_prime)[:, target_class].item()
+    delta_f = f_x - f_xp
+    target_density = delta_f / N  # target gᵢ for each step
+
+    # Initialize: straight-line path and velocity
+    direction = x - x_prime
+    velocities = [direction.clone() for _ in range(N)]
+    waypoints = [x_prime + (i / N) * direction for i in range(N + 1)]
+
+    history = []
+
+    for outer in range(cfg.n_iters):
+        # ===== Step 1: Compute densities =====
+        grads = []
+        densities = []
+        for i in range(N):
+            g, _ = model_grad(model_f, waypoints[i], target_class)
+            grads.append(g)
+            d_i = (g * velocities[i]).flatten(1).sum(1).item()
+            densities.append(d_i)
+
+        # ===== Step 2: Scale velocities =====
+        for i in range(N):
+            g_i = densities[i]
+
+            if abs(g_i) < 1e-10:
+                # Density ≈ 0: can't scale meaningfully, keep current velocity
+                scale = 1.0
+            else:
+                scale = target_density / g_i
+
+            # Clamp to prevent explosion
+            scale = max(cfg.clamp_lo, min(cfg.clamp_hi, scale))
+
+            v_new = scale * velocities[i]
+
+            # Momentum: blend with previous velocity
+            velocities[i] = cfg.momentum * v_new + (1 - cfg.momentum) * velocities[i]
+
+        # ===== Step 3: Endpoint correction =====
+        # Current total displacement: (1/N) Σ velocities[i]
+        # Should equal: x - x'
+        total_disp = sum(v for v in velocities)  # each contributes v/N to path
+        actual_endpoint = x_prime + total_disp / N
+        endpoint_error = x - actual_endpoint
+
+        # Distribute correction uniformly across all steps
+        correction_per_step = endpoint_error * N  # each velocity gets this added
+        for i in range(N):
+            # Add a fraction of the correction, weighted toward later steps
+            # to preserve the early part of the path
+            weight = (i + 1) / (N * (N + 1) / 2)  # triangular: later steps get more
+            velocities[i] = velocities[i] + weight * correction_per_step
+
+        # ===== Step 4: Reintegrate path =====
+        waypoints = [x_prime.clone()]
+        for i in range(N):
+            waypoints.append(waypoints[-1] + (1.0 / N) * velocities[i])
+
+        # ===== Logging =====
+        endpoint_l2 = (waypoints[-1] - x).flatten(1).norm(1).mean().item()
+
+        # Recompute actual densities after reintegration
+        actual_densities = []
+        for i in range(N):
+            g, _ = model_grad(model_f, waypoints[i], target_class)
+            step = waypoints[i+1] - waypoints[i]
+            d = (g * step).flatten(1).sum(1).item() * N
+            actual_densities.append(d)
+
+        attr_sum = sum(actual_densities) / N
+        compl_err = abs(attr_sum - delta_f)
+
+        import numpy as np
+        roughness = np.var(actual_densities)
+        mean_dens = np.mean(actual_densities)
+        cv = np.std(actual_densities) / (abs(mean_dens) + 1e-10)  # coefficient of variation
+
+        if outer % cfg.log_every == 0 or outer == cfg.n_iters - 1:
+            print(f"  [{outer:2d}/{cfg.n_iters}] "
+                  f"compl={compl_err:.3f} "
+                  f"endpt={endpoint_l2:.4f} "
+                  f"CV={cv:.3f} "
+                  f"roughness={roughness:.1f} "
+                  f"Σattr={attr_sum:.3f}")
+            history.append({
+                "iter": outer, "compl_err": compl_err,
+                "endpoint_l2": endpoint_l2, "cv": cv,
+                "roughness": roughness,
+            })
+
+    # ===== Final attributions =====
+    attr = torch.zeros_like(x)
+    final_densities = []
+    for i in range(N):
+        g, _ = model_grad(model_f, waypoints[i], target_class)
+        step = waypoints[i+1] - waypoints[i]
+        attr += g * step
+        final_densities.append((g * step).flatten(1).sum(1).item() * N)
+
+    return attr, waypoints, final_densities, history
+
+
+# =============================================================================
+# 6. METRICS
+# =============================================================================
+
+def concentration_ratio(densities, delta_f, tau=0.9):
+    """Smallest fraction of steps carrying τ of |Δf|."""
+    N = len(densities)
+    abs_d = sorted([abs(d) for d in densities], reverse=True)
+    target = tau * abs(delta_f)
+    cumsum = 0.0
+    for k, d in enumerate(abs_d, 1):
+        cumsum += d
+        if cumsum >= target:
+            return k / N
+    return 1.0
+
+
+def density_cv(densities):
+    """Coefficient of variation of density. Lower = smoother = better."""
+    import numpy as np
+    d = np.array(densities)
+    return np.std(d) / (abs(np.mean(d)) + 1e-10)
+
+
+def compute_logit_profile(model_f, path, target_class):
+    logits = []
+    with torch.no_grad():
+        for z in path:
+            logits.append(model_f(z)[:, target_class].item())
+    return logits
+
+
+# =============================================================================
+# 7. VISUALIZATION
+# =============================================================================
+
+def plot_comparison(x, attrs, info, save_path=None):
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    img = x[0].cpu().permute(1, 2, 0).numpy()
+    img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+
+    def heatmap(a):
+        h = a[0].cpu().abs().sum(0).numpy()
+        p99 = np.percentile(h, 99)
+        return np.clip(h / max(p99, 1e-10), 0, 1)
+
+    names = list(attrs.keys())
+    n = len(names) + 1
+    fig, axes = plt.subplots(1, n, figsize=(5 * n, 5))
+    axes[0].imshow(img); axes[0].set_title("Input"); axes[0].axis("off")
+    for i, name in enumerate(names):
+        axes[i+1].imshow(heatmap(attrs[name]), cmap="hot", vmin=0, vmax=1)
+        axes[i+1].set_title(name); axes[i+1].axis("off")
+
+    parts = [f"{n}:{info['compl'][n]:.2f}" for n in names]
+    fig.suptitle(f"Completeness — {', '.join(parts)}  (Δf={info['delta_f']:.2f})\n"
+                 f"Per-image normalized (99th pctl)")
+    plt.tight_layout()
+    if save_path: plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+
+
+def plot_profiles(profiles, delta_f, save_path=None):
+    import matplotlib.pyplot as plt
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 5))
+
+    for name, logits, color in profiles["logits"]:
+        a = [i / (len(logits)-1) for i in range(len(logits))]
+        ax1.plot(a, logits, color=color, label=name, alpha=0.8)
+    ax1.set_xlabel("α"); ax1.set_ylabel("f(γ(α))"); ax1.set_title("Logit profile")
+    ax1.legend(); ax1.grid(True, alpha=0.3)
+
+    for name, dens, color in profiles["densities"]:
+        a = [(i+0.5)/len(dens) for i in range(len(dens))]
+        ax2.plot(a, dens, color=color, label=name, alpha=0.8)
+    ax2.axhline(delta_f, color="gray", ls="--", alpha=0.5, label=f"Δf={delta_f:.2f}")
+    ax2.axhline(delta_f/len(profiles["densities"][0][1]), color="gray", ls=":",
+                alpha=0.3, label=f"Δf/N={delta_f/len(profiles['densities'][0][1]):.2f}")
+    ax2.set_xlabel("α"); ax2.set_ylabel("∇f·γ' (density)")
+    ax2.set_title("Attribution density (target: flat line at Δf/N)")
+    ax2.legend(); ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    if save_path: plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+
+
+def plot_concentration(all_densities, delta_f, save_path=None):
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    for name, dens, color in all_densities:
+        N = len(dens)
+        abs_d = sorted([abs(d) for d in dens], reverse=True)
+        cumsum = np.cumsum(abs_d) / (abs(delta_f) + 1e-10)
+        fracs = np.arange(1, N+1) / N
+        ax.plot(fracs, cumsum, color=color, label=name, alpha=0.8, linewidth=2)
+        cr = concentration_ratio(dens, delta_f, tau=0.9)
+        ax.plot(cr, 0.9, 'o', color=color, markersize=8)
+        ax.annotate(f"{cr:.0%}", (cr, 0.9), textcoords="offset points",
+                    xytext=(5, -15), fontsize=10, color=color)
+
+    ax.axhline(0.9, color="gray", ls=":", alpha=0.4)
+    ax.plot([0, 1], [0, 1], 'k--', alpha=0.2, label="Uniform (worst)")
+    ax.set_xlabel("Fraction of steps (sorted by |density|)")
+    ax.set_ylabel("Cumulative fraction of |Δf|")
+    ax.set_title("Concentration curve")
+    ax.legend(); ax.grid(True, alpha=0.3)
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1.05)
+
+    plt.tight_layout()
+    if save_path: plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+
+
+def plot_smoothing_progress(history, save_path=None):
+    """Show how roughness decreases over iterations."""
+    import matplotlib.pyplot as plt
+
+    iters = [h["iter"] for h in history]
+    cvs = [h["cv"] for h in history]
+    compls = [h["compl_err"] for h in history]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+
+    ax1.plot(iters, cvs, 'o-', color="#1D9E75", linewidth=2)
+    ax1.set_xlabel("Iteration"); ax1.set_ylabel("CV of density")
+    ax1.set_title("Density smoothness (lower = better)")
+    ax1.grid(True, alpha=0.3)
+
+    ax2.plot(iters, compls, 'o-', color="#D85A30", linewidth=2)
+    ax2.set_xlabel("Iteration"); ax2.set_ylabel("Completeness error")
+    ax2.set_title("Completeness (lower = better)")
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    if save_path: plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+
+
+# =============================================================================
+# 8. DEMO
+# =============================================================================
+
+def demo():
+    import os
+
+    try:
+        import torchvision.models as models
+        import torchvision.transforms as T
+    except ImportError:
+        print("pip install torchvision"); return
+
+    device = ("cuda" if torch.cuda.is_available()
+              else "mps" if hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+              else "cpu")
+    print(f"Device: {device}")
+
+    print("Loading ResNet-50...")
+    model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT).to(device).eval()
+    for p in model.parameters(): p.requires_grad_(False)
+
+    MIN_CONF = 0.70
+    tf = T.Compose([T.Resize(256), T.CenterCrop(224), T.ToTensor(),
+                     T.Normalize([.485,.456,.406], [.229,.224,.225])])
+
+    loaded = False
+    for sample_dir in ["./sample_imagenet1k", "../sample_imagenet1k",
+                        os.path.expanduser("~/sample_imagenet1k")]:
+        if os.path.isdir(sample_dir):
+            try:
+                from PIL import Image
+                jpegs = sorted([f for f in os.listdir(sample_dir)
+                                if f.lower().endswith(('.jpeg', '.jpg', '.png'))])
+                print(f"Found {sample_dir} ({len(jpegs)} images)")
+                for fname in jpegs:
+                    try: img = Image.open(os.path.join(sample_dir, fname)).convert("RGB")
+                    except: continue
+                    xc = tf(img).unsqueeze(0).to(device)
+                    with torch.no_grad():
+                        p = F.softmax(model(xc), -1)
+                        c, pr = p[0].max(0)
+                    if c.item() >= MIN_CONF:
+                        x, pc, cf = xc, pr.item(), c.item()
+                        print(f"  {fname} → class={pc}, conf={cf:.4f}")
+                        loaded = True; break
+            except Exception as e:
+                print(f"  Error: {e}")
+            if loaded: break
+
+    if not loaded:
+        try:
+            from torchvision.datasets import CIFAR10
+            ctf = T.Compose([T.Resize(224), T.ToTensor(),
+                             T.Normalize([.485,.456,.406],[.229,.224,.225])])
+            ds = CIFAR10("./data", False, download=True, transform=ctf)
+            for i in range(500):
+                im, _ = ds[i]
+                xc = im.unsqueeze(0).to(device)
+                with torch.no_grad():
+                    p = F.softmax(model(xc), -1)
+                    c, pr = p[0].max(0)
+                if c.item() >= MIN_CONF:
+                    x, pc, cf = xc, pr.item(), c.item()
+                    print(f"CIFAR-10 idx={i}, class={pc}, conf={cf:.4f}")
+                    loaded = True; break
+        except Exception as e:
+            print(f"CIFAR-10: {e}")
+
+    if not loaded:
+        print("Synthetic fallback")
+        m = torch.tensor([.485,.456,.406], device=device).view(1,3,1,1)
+        s = torch.tensor([.229,.224,.225], device=device).view(1,3,1,1)
+        torch.manual_seed(42)
+        x = ((torch.randn(1,3,224,224,device=device)*.2+.5).clamp(0,1)-m)/s
+        with torch.no_grad():
+            p = F.softmax(model(x),-1); cf,pr=p[0].max(0); pc,cf=pr.item(),cf.item()
+
+    x_prime = torch.zeros_like(x)
+    with torch.no_grad():
+        delta_f = (model(x)[:, pc] - model(x_prime)[:, pc]).item()
+    print(f"Class: {pc}, conf: {cf:.4f}, Δf: {delta_f:.3f}")
+
+    N = 50
+    colors = {
+        "IG": "#D85A30", "IDGI": "#7F77DD",
+        "Guided IG": "#378ADD", "AP-IG": "#1D9E75"
+    }
+
+    # ==========================================
+    # 1. VANILLA IG
+    # ==========================================
+    print(f"\n{'='*55}")
+    print("1. Vanilla IG")
+    print(f"{'='*55}")
+    t0 = time.perf_counter()
+    attr_ig, dens_ig, ig_path = compute_vanilla_ig(model, x, x_prime, pc, N=N)
+    t_ig = time.perf_counter() - t0
+    ig_logits = compute_logit_profile(model, ig_path, pc)
+    ig_sum = attr_ig.flatten(1).sum(1).item()
+    cr_ig = concentration_ratio(dens_ig, delta_f)
+    cv_ig = density_cv(dens_ig)
+    print(f"  Time: {t_ig:.1f}s  Σattr: {ig_sum:.3f}  CR₉₀: {cr_ig:.1%}  CV: {cv_ig:.2f}")
+
+    # ==========================================
+    # 2. IDGI
+    # ==========================================
+    print(f"\n{'='*55}")
+    print("2. IDGI")
+    print(f"{'='*55}")
+    t0 = time.perf_counter()
+    attr_idgi, dens_idgi, idgi_path = compute_idgi(model, x, x_prime, pc, N=N)
+    t_idgi = time.perf_counter() - t0
+    idgi_logits = compute_logit_profile(model, idgi_path, pc)
+    idgi_sum = attr_idgi.flatten(1).sum(1).item()
+    cr_idgi = concentration_ratio(dens_idgi, delta_f)
+    cv_idgi = density_cv(dens_idgi)
+    print(f"  Time: {t_idgi:.1f}s  Σattr: {idgi_sum:.3f}  CR₉₀: {cr_idgi:.1%}  CV: {cv_idgi:.2f}")
+
+    # ==========================================
+    # 3. GUIDED IG
+    # ==========================================
+    print(f"\n{'='*55}")
+    print("3. Guided IG")
+    print(f"{'='*55}")
+    t0 = time.perf_counter()
+    attr_gig, gig_path, dens_gig = compute_guided_ig(model, x, x_prime, pc, N=N)
+    t_gig = time.perf_counter() - t0
+    gig_logits = compute_logit_profile(model, gig_path, pc)
+    gig_sum = attr_gig.flatten(1).sum(1).item()
+    cr_gig = concentration_ratio(dens_gig, delta_f)
+    cv_gig = density_cv(dens_gig)
+    print(f"  Time: {t_gig:.1f}s  Σattr: {gig_sum:.3f}  CR₉₀: {cr_gig:.1%}  CV: {cv_gig:.2f}")
+
+    # ==========================================
+    # 4. ADAPTIVE PATH IG
+    # ==========================================
+    print(f"\n{'='*55}")
+    print("4. Adaptive Path IG")
+    print(f"{'='*55}")
+    t0 = time.perf_counter()
+    attr_ap, ap_path, dens_ap, ap_history = adaptive_path_ig(
+        model, x, x_prime, pc, N=N,
+        cfg=AdaptiveConfig(n_iters=10, clamp_lo=0.1, clamp_hi=10.0, momentum=0.5),
+        chunk=16,
+    )
+    t_ap = time.perf_counter() - t0
+    ap_logits = compute_logit_profile(model, ap_path, pc)
+    ap_sum = attr_ap.flatten(1).sum(1).item()
+    cr_ap = concentration_ratio(dens_ap, delta_f)
+    cv_ap = density_cv(dens_ap)
+    print(f"  Time: {t_ap:.1f}s  Σattr: {ap_sum:.3f}  CR₉₀: {cr_ap:.1%}  CV: {cv_ap:.2f}")
+
+    # ==========================================
+    # SUMMARY
+    # ==========================================
+    print(f"\n{'='*82}")
+    print(f"{'':22} {'IG':>8} {'IDGI':>8} {'GuidedIG':>10} {'AP-IG':>8}")
+    print(f"{'-'*82}")
+    print(f"  Time (s)            {t_ig:8.1f} {t_idgi:8.1f} {t_gig:10.1f} {t_ap:8.1f}")
+    print(f"  Σ attr              {ig_sum:+8.3f} {idgi_sum:+8.3f} {gig_sum:+10.3f} {ap_sum:+8.3f}")
+    print(f"  Compl. error        {abs(ig_sum-delta_f):8.3f} {abs(idgi_sum-delta_f):8.3f} {abs(gig_sum-delta_f):10.3f} {abs(ap_sum-delta_f):8.3f}")
+    print(f"  Density CV          {cv_ig:8.2f} {cv_idgi:8.2f} {cv_gig:10.2f} {cv_ap:8.2f}")
+    print(f"  Concentration CR₉₀  {cr_ig:7.1%} {cr_idgi:7.1%} {cr_gig:9.1%} {cr_ap:7.1%}")
+    print(f"  Expected Δf         {delta_f:+8.3f}")
+    print(f"{'='*82}")
+
+    # ==========================================
+    # PLOTS
+    # ==========================================
+    attrs = {"IG": attr_ig, "IDGI": attr_idgi, "Guided IG": attr_gig, "AP-IG": attr_ap}
+    info = {
+        "delta_f": delta_f,
+        "compl": {
+            "IG": abs(ig_sum - delta_f), "IDGI": abs(idgi_sum - delta_f),
+            "Guided IG": abs(gig_sum - delta_f), "AP-IG": abs(ap_sum - delta_f),
+        },
+    }
+
+    try:
+        plot_comparison(x, attrs, info, "attr_v7.png")
+
+        profiles = {
+            "logits": [
+                ("IG", ig_logits, colors["IG"]),
+                ("IDGI", idgi_logits, colors["IDGI"]),
+                ("Guided IG", gig_logits, colors["Guided IG"]),
+                ("AP-IG", ap_logits, colors["AP-IG"]),
+            ],
+            "densities": [
+                ("IG", dens_ig, colors["IG"]),
+                ("IDGI", dens_idgi, colors["IDGI"]),
+                ("Guided IG", dens_gig, colors["Guided IG"]),
+                ("AP-IG", dens_ap, colors["AP-IG"]),
+            ],
+        }
+        plot_profiles(profiles, delta_f, "profiles_v7.png")
+
+        conc_data = [
+            ("IG", dens_ig, colors["IG"]),
+            ("IDGI", dens_idgi, colors["IDGI"]),
+            ("Guided IG", dens_gig, colors["Guided IG"]),
+            ("AP-IG", dens_ap, colors["AP-IG"]),
+        ]
+        plot_concentration(conc_data, delta_f, "concentration_v7.png")
+
+        plot_smoothing_progress(ap_history, "smoothing_v7.png")
+
+        print("Saved: attr_v7.png, profiles_v7.png, concentration_v7.png, smoothing_v7.png")
+    except ImportError:
+        print("pip install matplotlib for plots")
+
+    return attrs, info
+
+
+if __name__ == "__main__":
+    demo()

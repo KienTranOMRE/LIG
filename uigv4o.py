@@ -1429,7 +1429,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Unified IG v2 optimised — ResNet-50 (PyTorch)")
     parser.add_argument("--json",              type=str,   default=None)
-    parser.add_argument("--steps",             type=int,   default=50)
+    parser.add_argument("--steps",             type=int,   default=20)
     parser.add_argument("--device",            type=str,   default=None)
     parser.add_argument("--min-conf",          type=float, default=0.70)
     parser.add_argument("--viz",               action="store_true")

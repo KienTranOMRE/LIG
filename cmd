@@ -10,3 +10,4 @@ python  uigv3.py --insdel --region-insdel --viz-insdel --viz-region-insdel
 # Custom grid size (larger patches = fewer regions = coarser test)
 python uigv3.py --region-insdel --no-slic --patch-size 40 --viz --viz-path my_heatmaps.png
 python uigv4.py --region-insdel --no-slic --patch-size 40 --viz --viz-path my_heatmaps.png
+python uigv4o.py --region-insdel --no-slic --patch-size 40 --viz --viz-path my_heatmaps.png

@@ -39,8 +39,8 @@ Method                Var_ν      CV²        𝒬     Time
 IG                 0.015749   0.0278   0.9730     0.1s
 IDGI               0.005221   0.0100   0.9901     0.1s
 Guided IG          0.012081   0.0403   0.9612     0.4s
-μ-Optimized        0.000254   0.0005   0.9995     0.2s
-Joint              0.000222   0.0004   0.9996    38.9s
+μ-LAM              0.000254   0.0005   0.9995     0.2s
+Join-LAM           0.000222   0.0004   0.9996    38.9s
 ```
 
 𝒬 = 1/(1 + CV²) is the quality score (1 = perfect conservation). μ-Optimised achieves 𝒬 > 0.999 at zero additional cost over standard IG. Joint pushes further by also optimising the path.

@@ -868,8 +868,20 @@ def load_image_and_model(device: torch.device, min_conf: float = 0.70):
 
     model = ClassLogitModel(backbone, target_class=pc).to(device).eval()
     baseline = torch.zeros_like(x)
+
+    # Extract human-readable class name from filename if possible
+    # ImageNet format: nXXXXXXXX_class_name.JPEG
+    class_name = None
+    if "/" in source:
+        fname = source.rsplit("/", 1)[-1]
+        name_part = fname.rsplit(".", 1)[0]        # strip extension
+        parts = name_part.split("_", 1)
+        if len(parts) == 2 and parts[0].startswith("n") and parts[0][1:].isdigit():
+            class_name = parts[1].replace("_", " ")
+
     info = {"source": source, "target_class": pc, "confidence": cf,
-            "model": "ResNet-50 (ImageNet pretrained)"}
+            "model": "ResNet-50 (ImageNet pretrained)",
+            "class_name": class_name}
     return model, x, baseline, info
 
 
@@ -898,6 +910,19 @@ def visualize_attributions(x, methods, info, save_path="attribution_heatmaps.png
 
     n = len(methods)
     fig, axes = plt.subplots(2, n+1, figsize=(3.6*(n+1), 7.5), facecolor="#0D0D0D")
+
+    # Build title from class name or class index
+    class_name = info.get("class_name")
+    class_id = info["target_class"]
+    if class_name:
+        label = f'"{class_name}" (class {class_id})'
+    else:
+        label = f"class {class_id}"
+    fig.suptitle(
+        f"{label}  ·  conf {info['confidence']:.1%}  ·  Δf = {delta_f:.2f}",
+        color="#E8E4DF", fontsize=12, fontfamily="monospace",
+        fontweight="bold", y=0.98,
+    )
 
     axes[0,0].imshow(img); axes[0,0].set_title("Original", color="#E8E4DF",
         fontsize=10, fontfamily="monospace"); axes[0,0].axis("off")

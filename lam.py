@@ -241,18 +241,19 @@ def _straight_line_pass(model: nn.Module, x: torch.Tensor,
         grad_batch = torch.cat(g_chunks, dim=0)      # (N, C, H, W)
 
     # ── Unpack results ──
-    # f_vals: [f_bl, f(γ_0), f(γ_1), ..., f(γ_{N-1}), f_x]
-    #   Note: f(γ_0) = f(baseline) from the batch (may differ by FP noise
-    #   from f_bl computed separately; we use f_bl for consistency).
-    f_vals_inner = f_batch.tolist()                  # N floats
-    f_vals = [f_bl] + f_vals_inner + [f_x]
+    # gamma_batch has N points: γ_0=baseline, γ_1, ..., γ_{N-1}
+    # We need f at N+1 points: γ_0, γ_1, ..., γ_{N-1}, γ_N=x
+    # f_batch gives f(γ_0) through f(γ_{N-1}), we add f(x) at the end
+    f_vals_inner = f_batch.tolist()                  # N floats: f(γ_0)..f(γ_{N-1})
+    f_vals = f_vals_inner + [f_x]                    # N+1 floats: f(γ_0)..f(γ_N=x)
 
-    # d_k = ∇f(γ_k) · step,  for each k
-    # grad_batch is (N, C, H, W), step is (1, C, H, W)
+    # d_k = ∇f(γ_k) · step,  for each k = 0..N-1
+    # This is the gradient-predicted change for the step γ_k → γ_{k+1}
     d_tensor = (grad_batch * step).view(N, -1).sum(dim=1)   # (N,)
     d_list = d_tensor.tolist()
 
-    # Δf_k = f_vals[k+1] - f_vals[k]
+    # Δf_k = f(γ_{k+1}) - f(γ_k),  for each k = 0..N-1
+    # Now properly aligned: d[k] and df[k] both refer to the step γ_k → γ_{k+1}
     df_list = [f_vals[k + 1] - f_vals[k] for k in range(N)]
 
     # grad norms
@@ -704,23 +705,6 @@ def joint_ig(model: nn.Module, x: torch.Tensor, baseline: torch.Tensor,
         d_list, df_list, f_vals, gnorms, grads, d_arr, df_arr = \
             _evaluate_path(gamma_pts, mu)
 
-        if s == 0:
-            # Compare with _straight_line_pass on the same data
-            _, _, _slp_grads, _slp_d, _slp_df, _slp_f, _slp_gn = \
-                _straight_line_pass(model, x, baseline, N)
-            _slp_d_t = torch.tensor(_slp_d, device=device)
-            _slp_df_t = torch.tensor(_slp_df, device=device)
-            _mu_slp = optimize_mu(_slp_d_t, _slp_df_t, tau=tau, n_iter=mu_iter)
-            _, _, _Q_slp = compute_all_metrics(_slp_d_t, _slp_df_t, _mu_slp)
-            _, _, _Q_ep = compute_all_metrics(d_arr, df_arr,
-                optimize_mu(d_arr, df_arr, tau=tau, n_iter=mu_iter))
-            _d_diff = (d_arr - _slp_d_t).abs().max().item()
-            _df_diff = (df_arr - _slp_df_t).abs().max().item()
-            print(f"  [diag] max|d_eval - d_slp| = {_d_diff:.8f}")
-            print(f"  [diag] max|df_eval - df_slp| = {_df_diff:.8f}")
-            print(f"  [diag] Q via _straight_line = {_Q_slp:.6f}")
-            print(f"  [diag] Q via _evaluate_path = {_Q_ep:.6f}")
-
         # Phase 1: optimise μ
         mu = optimize_mu(d_arr, df_arr, tau=tau, n_iter=mu_iter)
         var_mu, cv2_mu, Q_mu = compute_all_metrics(d_arr, df_arr, mu)
@@ -774,13 +758,6 @@ def joint_ig(model: nn.Module, x: torch.Tensor, baseline: torch.Tensor,
     gamma_pts = best_gamma_pts
     mu = best_mu
     grads = best_grads
-
-    # Debug: verify metrics match what the guard saw
-    _d_check = torch.tensor(best_d_list, device=device)
-    _df_check = torch.tensor(best_df_list, device=device)
-    _v, _c, _q = compute_all_metrics(_d_check, _df_check, mu)
-    print(f"  [joint] guard best_Q={best_Q:.6f}  recomputed Q={_q:.6f}  "
-          f"Var={_v:.6f}  CV2={_c:.6f}")
 
     attr = torch.zeros_like(x)
     for k in range(N):

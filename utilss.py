@@ -53,6 +53,7 @@ class AttributionResult:
     attributions: torch.Tensor
     Q: float
     CV2: float
+    Var_nu: float                  # ← add this
     steps: list[StepInfo]
     Q_history: list[dict] = field(default_factory=list)
     elapsed_s: float = 0.0
@@ -64,6 +65,7 @@ class AttributionResult:
             "name": self.name,
             "Q": self.Q,
             "CV2": self.CV2,
+            "Var_nu": self.Var_nu,   # ← add this
             "steps": [asdict(s) for s in self.steps],
             "Q_history": self.Q_history,
             "elapsed_s": self.elapsed_s,

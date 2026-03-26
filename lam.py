@@ -258,8 +258,8 @@ def _straight_line_pass(model: nn.Module, x: torch.Tensor,
     # grad norms
     gnorms = grad_batch.view(N, -1).norm(dim=1).tolist()     # N floats
 
-    # grads as list of (1, C, H, W) for downstream compatibility
-    grads = [grad_batch[k:k+1] for k in range(N)]
+    # grads as list of (1, C, H, W) — clone to avoid shared-memory bugs
+    grads = [grad_batch[k:k+1].clone() for k in range(N)]
 
     return delta_x, target, grads, d_list, df_list, f_vals, gnorms
 
@@ -693,7 +693,8 @@ def joint_ig(model: nn.Module, x: torch.Tensor, baseline: torch.Tensor,
         dl = dt.tolist()
         dfl = (fa[1:] - fa[:N]).tolist()
         gn = gb.view(N, -1).norm(dim=1).tolist()
-        gr = [gb[k:k+1] for k in range(N)]
+        # Clone each slice so it doesn't share memory with gb
+        gr = [gb[k:k+1].clone() for k in range(N)]
         da = torch.tensor(dl, device=device)
         dfa = torch.tensor(dfl, device=device)
         return dl, dfl, fv, gn, gr, da, dfa

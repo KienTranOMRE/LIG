@@ -379,9 +379,9 @@ def optimize_mu(d: torch.Tensor, delta_f: torch.Tensor,
                 tau: float = 0.01, n_iter: int = 200,
                 lr: float = 0.05) -> torch.Tensor:
     """
-    Find μ minimising  Var_ν(φ) + τ·Σ μ_k log μ_k.
+    Find μ minimising  CV²(φ) + τ·Σ μ_k log μ_k.
 
-    This directly minimises the paper's primary objective (Var, not CV²).
+    Uses CV²(φ) = Var_ν(φ) / φ̄² as objective (scale-aware).
     Adam on softmax logits → unconstrained optimisation on the simplex.
     """
     device = d.device
@@ -410,9 +410,11 @@ def optimize_mu(d: torch.Tensor, delta_f: torch.Tensor,
         mean_phi = (w * phi).sum()
         var_phi = (w * (phi - mean_phi) ** 2).sum()
 
-        # OBJECTIVE: Var_ν(φ), NOT CV²(φ)
+        # CV²(φ) = Var_ν(φ) / φ̄² — scale-aware, prevents φ̄ → 0
+        cv2 = var_phi / (mean_phi ** 2 + 1e-15)
+
         entropy = (mu * torch.log(mu + 1e-15)).sum()
-        loss = var_phi + tau * entropy
+        loss = cv2 + tau * entropy
 
         loss.backward()
         opt.step()
@@ -591,46 +593,51 @@ def _compute_path_obj(d_v: torch.Tensor, df_v: torch.Tensor,
 
 
 def optimize_path(model, x, baseline, mu, N=50, G=16, patch_size=14,
-                  n_iter=15, lr=0.05):
+                  n_iter=15, lr=0.08):
     """
-    Optimise path via grouped velocity scheduling.
+    Optimise path via grouped spatial velocity scheduling.
 
-    Objective: maximise Q (minimise 1-Q), which prevents the path from
-    collapsing to constant-but-wrong fidelity.
-    Softmax over time dim per group → normalisation built in.
+    Matches the proven v2 approach:
+      - V is clamped (≥ 0.01), not softmax-parameterised
+      - Objective is CV²(φ) (scale-aware, proven stable)
+      - Stochastic FD: one random time step per group per iteration
+        (reduces cost from O(G·N) to O(G) evaluations per iteration)
 
-    FIX 2: _obj_of uses _eval_path_batched (2 model calls instead of 2N).
+    FIX 2: _eval_of uses _eval_path_batched (2 model calls instead of 2N).
     """
     device = x.device
     delta_x = x - baseline
     gmap = _build_spatial_groups(model, x, baseline, G, patch_size)
 
-    log_V = torch.zeros(G, N, device=device)
-    best_obj, best_logV = float("inf"), log_V.clone()
+    # Initialise: uniform velocity = straight line
+    V = torch.ones(G, N, device=device)
+    best_cv2 = float("inf")
+    best_V = V.clone()
 
-    def _obj_of(lv):
-        V = torch.softmax(lv, dim=1) * N
-        gp = _build_path_2d(baseline, delta_x, V, gmap, N)
+    def _cv2_of(Vm):
+        gp = _build_path_2d(baseline, delta_x, Vm, gmap, N)
         d_v, df_v = _eval_path_batched(model, gp, N, device)
-        return _compute_path_obj(d_v, df_v, mu)
+        return compute_CV2(d_v, df_v, mu)
 
-    eps = 0.1
+    eps = 0.05
     for it in range(n_iter):
-        cur_obj = _obj_of(log_V)
-        if cur_obj < best_obj:
-            best_obj, best_logV = cur_obj, log_V.clone()
+        cv2 = _cv2_of(V)
+        if cv2 < best_cv2:
+            best_cv2 = cv2
+            best_V = V.clone()
 
-        # Probe one group per iteration (cycle), all N time steps
-        g = it % G
-        grad_lv = torch.zeros_like(log_V)
-        for k in range(N):
-            log_V[g, k] += eps
-            grad_lv[g, k] = (_obj_of(log_V) - cur_obj) / eps
-            log_V[g, k] -= eps
+        # Stochastic FD: perturb one random time step per group
+        grad_V = torch.zeros_like(V)
+        for g in range(G):
+            k = torch.randint(0, N, (1,)).item()
+            V[g, k] += eps
+            cv2_plus = _cv2_of(V)
+            grad_V[g, k] = (cv2_plus - cv2) / eps
+            V[g, k] -= eps
 
-        log_V = log_V - lr * grad_lv
+        V = V - lr * grad_V
+        V = torch.clamp(V, min=0.01)
 
-    best_V = torch.softmax(best_logV, dim=1) * N
     return _build_path_2d(baseline, delta_x, best_V, gmap, N)
 
 

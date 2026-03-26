@@ -62,7 +62,7 @@ python LAM.py
 # With attribution heatmaps and fidelity diagnostics
 python LAM.py --viz --viz-fidelity
 
-# Initialise Joint from Guided IG path (often better)
+# Initialise Joint from Guided IG path
 python LAM.py --guided-init
 
 # Export results to JSON

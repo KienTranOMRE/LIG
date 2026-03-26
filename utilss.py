@@ -541,3 +541,34 @@ def visualize_step_fidelity(
     plt.close(fig)
     print(f"✓ Step fidelity saved → {save_path}")
     return save_path
+
+def compute_Var_nu(d: torch.Tensor, delta_f: torch.Tensor,
+                   mu: torch.Tensor) -> float:
+    """
+    Var_ν(φ) — the primary objective (Eq. 13).
+
+    Args:
+        d:       (N,) tensor of d_k = ∇f(γ_k) · Δγ_k
+        delta_f: (N,) tensor of Δf_k = f(γ_{k+1}) - f(γ_k)
+        mu:      (N,) tensor of attribution measure weights (sums to 1)
+
+    Returns:
+        Weighted variance of step fidelity under effective measure ν.
+    """
+    # φ_k = d_k / Δf_k  (skip steps with negligible Δf)
+    valid = delta_f.abs() > 1e-12
+    safe_df = torch.where(valid, delta_f, torch.ones_like(delta_f))
+    phi = torch.where(valid, d / safe_df, torch.ones_like(d))
+
+    # ν_k = μ_k Δf_k² / Σ_j μ_j Δf_j²
+    nu = mu * delta_f ** 2
+    nu_sum = nu.sum()
+    if nu_sum < 1e-15:
+        return 0.0
+    nu = nu / nu_sum
+
+    # Var_ν(φ) = Σ_k ν_k (φ_k - φ̄_ν)²
+    phi_bar = (nu * phi).sum()
+    var_nu = (nu * (phi - phi_bar) ** 2).sum()
+
+    return float(var_nu)

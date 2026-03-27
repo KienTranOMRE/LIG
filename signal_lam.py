@@ -666,7 +666,7 @@ if __name__ == "__main__":
     parser.add_argument("--json", type=str, default=None)
     args = parser.parse_args()
 
-    from unified_ig import load_image_and_model, _forward_scalar
+    from lam import load_image_and_model, _forward_scalar
     from utilss import get_device
 
     device = get_device(force=args.device)

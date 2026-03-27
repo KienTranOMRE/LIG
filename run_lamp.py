@@ -15,7 +15,7 @@ Drop this file next to unified_ig.py, utilss.py, lamp.py and run.
 import argparse
 import json
 
-from unified_ig import (
+from LAM import (
     get_device,
     standard_ig, idgi, guided_ig, mu_optimized_ig, joint_ig,
     load_image_and_model, _forward_scalar,

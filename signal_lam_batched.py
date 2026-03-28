@@ -67,7 +67,8 @@ def _eval_path_batched_single(model, gamma_pts, N, device):
     return d_vec, df_vec
 
 
-def _eval_multiple_paths_batched(model, baseline, delta_x, V_list, gmap, N, device):
+def _eval_multiple_paths_batched(model, baseline, delta_x, V_list, gmap, N, device,
+                                  chunk_size=None):
     """
     Evaluate multiple paths (from different V matrices) in batched forward/backward calls.
 
@@ -81,6 +82,7 @@ def _eval_multiple_paths_batched(model, baseline, delta_x, V_list, gmap, N, devi
         gmap: Spatial group mapping
         N: Number of steps
         device: torch device
+        chunk_size: If not None, process in chunks to reduce memory (e.g., 4 or 8)
 
     Returns:
         d_list: List of B tensors, each (N,) containing d_k values
@@ -91,6 +93,32 @@ def _eval_multiple_paths_batched(model, baseline, delta_x, V_list, gmap, N, devi
         Batched:  1 model call processing B×(N+1) points
                   (Memory bounded: may need to sub-batch if B×(N+1) too large)
     """
+    B = len(V_list)
+
+    # ════════════════════════════════════════════════════════════
+    # MEMORY OPTIMIZATION: Process in chunks if requested
+    # ════════════════════════════════════════════════════════════
+    if chunk_size is not None and chunk_size < B:
+        d_list_all = []
+        df_list_all = []
+
+        for start_idx in range(0, B, chunk_size):
+            end_idx = min(start_idx + chunk_size, B)
+            V_chunk = V_list[start_idx:end_idx]
+
+            d_chunk, df_chunk = _eval_multiple_paths_batched(
+                model, baseline, delta_x, V_chunk, gmap, N, device,
+                chunk_size=None  # Don't chunk recursively
+            )
+
+            d_list_all.extend(d_chunk)
+            df_list_all.extend(df_chunk)
+
+        return d_list_all, df_list_all
+
+    # ════════════════════════════════════════════════════════════
+    # FULL BATCHED EVALUATION (original code)
+    # ════════════════════════════════════════════════════════════
     B = len(V_list)
 
     # Build all B paths
@@ -162,6 +190,7 @@ def optimize_path_signal_harvesting_batched(
     n_iter: int = 15,
     lr: float = 0.08,
     lam: float = 1.0,
+    chunk_size: Optional[int] = None,
 ):
     """
     Batched path optimization: ALL group perturbations evaluated in parallel.
@@ -174,6 +203,15 @@ def optimize_path_signal_harvesting_batched(
         Original: 1 + G model calls = 1 + 16 = 17 calls
         Batched:  1 + 1 batched call (processing G×(N+1) points)
                   ≈ 2 calls with larger batch size
+
+    Args:
+        chunk_size: If not None, process groups in chunks to reduce memory.
+                    E.g., chunk_size=4 processes 4 groups at a time instead of all G.
+                    Reduces memory by G/chunk_size factor.
+                    chunk_size=None: Process all G groups together (fastest, most memory)
+                    chunk_size=8: Process 8 groups at a time (2× less memory if G=16)
+                    chunk_size=4: Process 4 groups at a time (4× less memory if G=16)
+                    chunk_size=1: Sequential (same as original, slowest, least memory)
 
     Effective speedup: ~8-10× (accounting for larger batches)
     Quality: IDENTICAL (same gradients, same updates)
@@ -218,9 +256,11 @@ def optimize_path_signal_harvesting_batched(
 
         # ════════════════════════════════════════════════════════════
         # KEY OPTIMIZATION: Evaluate all G perturbations in parallel
+        # (or in chunks if chunk_size is specified)
         # ════════════════════════════════════════════════════════════
         d_list, df_list = _eval_multiple_paths_batched(
-            model, baseline, delta_x, V_perturbed_list, gmap, N, device
+            model, baseline, delta_x, V_perturbed_list, gmap, N, device,
+            chunk_size=chunk_size
         )
 
         # Compute objectives for all perturbed paths
@@ -253,6 +293,7 @@ def joint_star_ig_batched(
     mu_iter: int = 300,
     path_iter: int = 10,
     init_path: Optional[list[torch.Tensor]] = None,
+    chunk_size: Optional[int] = None,
 ) -> AttributionResult:
     """
     Batched Joint* — IDENTICAL results to signal_lam.joint_star_ig, but faster.
@@ -272,6 +313,14 @@ def joint_star_ig_batched(
         mu_iter: μ optimization iterations (default: 300)
         path_iter: Path optimization iterations (default: 10)
         init_path: Optional warm-start path
+        chunk_size: MEMORY CONTROL - Process groups in chunks to reduce GPU memory.
+                    None (default): Process all G groups together (fastest, most memory)
+                    8: Process 8 groups at a time (2× less memory for G=16)
+                    4: Process 4 groups at a time (4× less memory for G=16)
+                    1: Sequential processing (same memory as original, no speedup)
+
+                    **Use this if you get CUDA OOM errors!**
+                    Recommended: chunk_size=4 or chunk_size=8 for 23GB GPU
 
     Returns:
         AttributionResult with same Q, Var_ν, attributions as original
@@ -358,7 +407,7 @@ def joint_star_ig_batched(
             new_gamma_pts = optimize_path_signal_harvesting_batched(
                 model, x, baseline, mu, N=N, G=G,
                 patch_size=patch_size, n_iter=path_iter,
-                lr=0.08, lam=lam)
+                lr=0.08, lam=lam, chunk_size=chunk_size)
 
             new_d_list, new_df_list, new_f_vals, new_gnorms, new_grads, \
                 new_d_arr, new_df_arr = _evaluate_path(new_gamma_pts, mu)

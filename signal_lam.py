@@ -628,12 +628,12 @@ def run_all_methods(
     results.append(mu_optimized_ig(
         model, x, baseline, N, lam=lam, tau=tau, n_iter=mu_iter))
 
-    # 5. Joint (λ=0)  — original LAM, no signal harvesting
-    init_path = gig.gamma_pts if guided_init else None
-    results.append(joint_ig(
-        model, x, baseline, N, G=G, n_alternating=n_alternating,
-        tau=0.005, mu_iter=mu_iter, path_iter=path_iter,
-        init_path=init_path))
+    # # 5. Joint (λ=0)  — original LAM, no signal harvesting
+    # init_path = gig.gamma_pts if guided_init else None
+    # results.append(joint_ig(
+    #     model, x, baseline, N, G=G, n_alternating=n_alternating,
+    #     tau=0.005, mu_iter=mu_iter, path_iter=path_iter,
+    #     init_path=init_path))
 
     # 6. Joint*  (λ>0) — full signal-harvesting solution
     init_path_star = gig.gamma_pts if guided_init else None

@@ -244,7 +244,8 @@ def optimize_path_signal_harvesting_batched(
         # BATCHED FINITE DIFFERENCES
         # ════════════════════════════════════════════════════════════
 
-        # Sample one random time step per group (same as original)
+        # CRITICAL FIX: Generate ALL random indices BEFORE any batching/chunking
+        # This ensures identical random state regardless of chunk_size
         k_indices = torch.randint(0, N, (G,), device=device)
 
         # Build G perturbed velocity matrices

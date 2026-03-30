@@ -700,26 +700,143 @@ def _signal_harvesting_path_obj(
 
 #     return _build_path_2d(baseline, delta_x, best_V, gmap, N)
 
+# def optimize_path_signal_harvesting(
+#     model, x, baseline, mu, N=50, G=16, patch_size=14,
+#     n_iter=15, lr=0.08, lam=1.0,
+#     momentum=0.7, block_size=None,
+#     early_stop_patience=10, early_stop_rtol=0.01, verbose=True,
+# ):
+#     device = x.device
+#     delta_x = x - baseline
+#     gmap = _build_spatial_groups(model, x, baseline, G, patch_size)
+
+#     V = torch.ones(G, N, device=device)
+#     best_obj = float("inf")
+#     best_V = V.clone()
+#     vel_V = torch.zeros_like(V)
+
+#     if block_size is None:
+#         block_size = max(N // 10, 3)
+
+#     def _obj_of(Vm):
+#         gp = _build_path_2d(baseline, delta_x, Vm, gmap, N)
+#         d_v, df_v = _eval_path_batched(model, gp, N, device)
+#         return _signal_harvesting_path_obj(d_v, df_v, mu, lam=lam)
+
+#     eps = 0.05
+#     stale_count = 0
+#     prev_best = float("inf")
+#     obj_history = []
+#     restarted = False
+
+#     for it in range(n_iter):
+#         t_it = time.time()
+#         obj = _obj_of(V)
+#         improved = obj < best_obj
+#         if improved:
+#             best_obj = obj
+#             best_V = V.clone()
+
+#         grad_V = torch.zeros_like(V)
+#         grad_norms_per_group = []
+#         for g in range(G):
+#             k0 = torch.randint(0, N - block_size + 1, (1,)).item()
+#             k1 = k0 + block_size
+#             z = torch.randn(block_size, device=device)
+#             z = z / z.norm() * block_size**0.5
+
+#             V[g, k0:k1] += eps * z
+#             obj_plus = _obj_of(V)
+#             V[g, k0:k1] -= eps * z
+
+#             grad_V[g, k0:k1] = ((obj_plus - obj) / eps) * z
+#             grad_norms_per_group.append(float(grad_V[g].norm()))
+
+#         # SGD with momentum
+#         vel_V = momentum * vel_V + grad_V
+#         V = V - lr * vel_V
+#         V = torch.clamp(V, min=0.01)
+
+#         dt = time.time() - t_it
+#         obj_history.append(best_obj)
+
+#         if verbose:
+#             mean_g = sum(grad_norms_per_group) / len(grad_norms_per_group)
+#             max_g = max(grad_norms_per_group)
+#             print(f"  path_opt iter {it:2d}/{n_iter}  "
+#                   f"obj={obj:+.6f}  best={best_obj:+.6f}  "
+#                   f"|∇V|={float(grad_V.norm()):.4f}  "
+#                   f"|vel|={float(vel_V.norm()):.4f}  "
+#                   f"mean/max_g={mean_g:.4f}/{max_g:.4f}  "
+#                   f"{'✓' if improved else ' '}  {dt:.2f}s")
+
+#         # Early stopping
+#         if abs(prev_best) > 1e-12:
+#             rel_change = abs(prev_best - best_obj) / abs(prev_best)
+#         else:
+#             rel_change = abs(prev_best - best_obj)
+
+#         if rel_change < early_stop_rtol:
+#             stale_count += 1
+#         else:
+#             stale_count = 0
+#         prev_best = best_obj
+
+#         # Restart from best_V halfway through patience
+#         if stale_count == early_stop_patience // 2 and not restarted:
+#             if verbose:
+#                 print(f"  🔄 Restart from best_V at iter {it}")
+#             V = best_V.clone()
+#             vel_V = torch.zeros_like(V)
+#             stale_count = 0
+#             restarted = True
+#             continue
+
+#         if stale_count >= early_stop_patience:
+#             if verbose:
+#                 print(f"  ⚡ Early stop at iter {it}: "
+#                       f"no improvement > {early_stop_rtol:.1%} "
+#                       f"for {early_stop_patience} iters")
+#             break
+
+#     if verbose:
+#         print(f"  path_opt done: {len(obj_history)} iters, "
+#               f"obj {obj_history[0]:+.4f} → {best_obj:+.4f}  "
+#               f"(Δ={obj_history[0] - best_obj:+.4f})")
+
+#     return _build_path_2d(baseline, delta_x, best_V, gmap, N)
+
 def optimize_path_signal_harvesting(
     model, x, baseline, mu, N=50, G=16, patch_size=14,
     n_iter=15, lr=0.08, lam=1.0,
-    momentum=0.7, block_size=None,
+    momentum=0.7, n_basis=5,
     early_stop_patience=10, early_stop_rtol=0.01, verbose=True,
 ):
     device = x.device
     delta_x = x - baseline
     gmap = _build_spatial_groups(model, x, baseline, G, patch_size)
 
-    V = torch.ones(G, N, device=device)
+    # Low-rank basis: smooth cosine functions over time
+    basis = torch.stack([
+        torch.cos(torch.arange(N, device=device, dtype=torch.float32) * j * 3.14159 / N)
+        for j in range(n_basis)
+    ])  # (n_basis, N)
+
+    # Coefficients: A (G, n_basis) — optimize this instead of V (G, N)
+    # Init: A[:,0] = 1.0 so V = 1 everywhere (straight line)
+    A = torch.zeros(G, n_basis, device=device)
+    A[:, 0] = 1.0
+
     best_obj = float("inf")
-    best_V = V.clone()
-    vel_V = torch.zeros_like(V)
+    best_A = A.clone()
+    vel_A = torch.zeros_like(A)
 
-    if block_size is None:
-        block_size = max(N // 10, 3)
+    def _V_from_A(Am):
+        return torch.clamp(Am @ basis, min=0.01)  # (G, N)
 
-    def _obj_of(Vm):
-        gp = _build_path_2d(baseline, delta_x, Vm, gmap, N)
+    def _obj_of(Am):
+        V = _V_from_A(Am)
+        gp = _build_path_2d(baseline, delta_x, V, gmap, N)
         d_v, df_v = _eval_path_batched(model, gp, N, device)
         return _signal_harvesting_path_obj(d_v, df_v, mu, lam=lam)
 
@@ -731,31 +848,26 @@ def optimize_path_signal_harvesting(
 
     for it in range(n_iter):
         t_it = time.time()
-        obj = _obj_of(V)
+        obj = _obj_of(A)
         improved = obj < best_obj
         if improved:
             best_obj = obj
-            best_V = V.clone()
+            best_A = A.clone()
 
-        grad_V = torch.zeros_like(V)
+        # FD gradient: one random basis coefficient per group
+        grad_A = torch.zeros_like(A)
         grad_norms_per_group = []
         for g in range(G):
-            k0 = torch.randint(0, N - block_size + 1, (1,)).item()
-            k1 = k0 + block_size
-            z = torch.randn(block_size, device=device)
-            z = z / z.norm() * block_size**0.5
-
-            V[g, k0:k1] += eps * z
-            obj_plus = _obj_of(V)
-            V[g, k0:k1] -= eps * z
-
-            grad_V[g, k0:k1] = ((obj_plus - obj) / eps) * z
-            grad_norms_per_group.append(float(grad_V[g].norm()))
+            j = torch.randint(0, n_basis, (1,)).item()
+            A[g, j] += eps
+            obj_plus = _obj_of(A)
+            grad_A[g, j] = (obj_plus - obj) / eps
+            A[g, j] -= eps
+            grad_norms_per_group.append(float(grad_A[g].norm()))
 
         # SGD with momentum
-        vel_V = momentum * vel_V + grad_V
-        V = V - lr * vel_V
-        V = torch.clamp(V, min=0.01)
+        vel_A = momentum * vel_A + grad_A
+        A = A - lr * vel_A
 
         dt = time.time() - t_it
         obj_history.append(best_obj)
@@ -765,8 +877,8 @@ def optimize_path_signal_harvesting(
             max_g = max(grad_norms_per_group)
             print(f"  path_opt iter {it:2d}/{n_iter}  "
                   f"obj={obj:+.6f}  best={best_obj:+.6f}  "
-                  f"|∇V|={float(grad_V.norm()):.4f}  "
-                  f"|vel|={float(vel_V.norm()):.4f}  "
+                  f"|∇A|={float(grad_A.norm()):.4f}  "
+                  f"|vel|={float(vel_A.norm()):.4f}  "
                   f"mean/max_g={mean_g:.4f}/{max_g:.4f}  "
                   f"{'✓' if improved else ' '}  {dt:.2f}s")
 
@@ -782,12 +894,12 @@ def optimize_path_signal_harvesting(
             stale_count = 0
         prev_best = best_obj
 
-        # Restart from best_V halfway through patience
+        # Restart from best halfway through patience
         if stale_count == early_stop_patience // 2 and not restarted:
             if verbose:
-                print(f"  🔄 Restart from best_V at iter {it}")
-            V = best_V.clone()
-            vel_V = torch.zeros_like(V)
+                print(f"  🔄 Restart from best_A at iter {it}")
+            A = best_A.clone()
+            vel_A = torch.zeros_like(A)
             stale_count = 0
             restarted = True
             continue
@@ -800,11 +912,14 @@ def optimize_path_signal_harvesting(
             break
 
     if verbose:
+        n_params = G * n_basis
         print(f"  path_opt done: {len(obj_history)} iters, "
+              f"{n_params} params (G={G} × basis={n_basis}), "
               f"obj {obj_history[0]:+.4f} → {best_obj:+.4f}  "
               f"(Δ={obj_history[0] - best_obj:+.4f})")
 
-    return _build_path_2d(baseline, delta_x, best_V, gmap, N)
+    V = _V_from_A(best_A)
+    return _build_path_2d(baseline, delta_x, V, gmap, N)
 # ═════════════════════════════════════════════════════════════════════════════
 # §7  JOINT* OPTIMISATION  (Algorithm 1 — Full Signal-Harvesting Solution)
 #

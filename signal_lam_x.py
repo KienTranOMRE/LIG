@@ -334,6 +334,56 @@ def _signal_harvesting_path_obj(
 #     We approximate this variationally via grouped velocity scheduling
 #     with the signal-harvesting path objective.
 # ═════════════════════════════════════════════════════════════════════════════
+# def optimize_path_signal_harvesting(
+#     model: nn.Module,
+#     x: torch.Tensor,
+#     baseline: torch.Tensor,
+#     mu: torch.Tensor,
+#     N: int = 50,
+#     G: int = 16,
+#     patch_size: int = 14,
+#     n_iter: int = 15,
+#     lr: float = 0.08,
+#     lam: float = 1.0,
+#     eps: float = 0.05,
+# ) -> list[torch.Tensor]:
+#     device = x.device
+#     delta_x = x - baseline
+#     gmap = _build_spatial_groups(model, x, baseline, G, patch_size)
+
+#     V = torch.ones(G, N, device=device)
+#     best_obj = float("inf")
+#     best_V = V.clone()
+
+#     def _obj_of(Vm: torch.Tensor) -> float:
+#         gp = _build_path_2d(baseline, delta_x, Vm, gmap, N)
+#         d_v, df_v = _eval_path_batched(model, gp, N, device)
+#         return _signal_harvesting_path_obj(d_v, df_v, mu, lam=lam)
+
+#     for it in range(n_iter):
+#         # SPSA: simultaneous perturbation with Rademacher ±1 vector
+#         Delta = (torch.randint(0, 2, (G, N), device=device) * 2 - 1).float()
+
+#         V_plus  = torch.clamp(V + eps * Delta, min=0.01)
+#         V_minus = torch.clamp(V - eps * Delta, min=0.01)
+
+#         obj_plus  = _obj_of(V_plus)    # call 1
+#         obj_minus = _obj_of(V_minus)   # call 2
+
+#         # Central difference gradient estimate for all G×N entries
+#         grad_est = (obj_plus - obj_minus) / (2.0 * eps) / Delta
+
+#         V = torch.clamp(V - lr * grad_est, min=0.01)
+
+#         # Track best
+#         obj = (obj_plus + obj_minus) / 2.0   # cheap proxy, no extra call
+#         if obj < best_obj:
+#             best_obj = obj
+#             best_V = V.clone()
+
+#     return _build_path_2d(baseline, delta_x, best_V, gmap, N)
+
+#Structure version m=3
 def optimize_path_signal_harvesting(
     model: nn.Module,
     x: torch.Tensor,
@@ -346,6 +396,7 @@ def optimize_path_signal_harvesting(
     lr: float = 0.08,
     lam: float = 1.0,
     eps: float = 0.05,
+    m_steps: int = 3,
 ) -> list[torch.Tensor]:
     device = x.device
     delta_x = x - baseline
@@ -361,29 +412,32 @@ def optimize_path_signal_harvesting(
         return _signal_harvesting_path_obj(d_v, df_v, mu, lam=lam)
 
     for it in range(n_iter):
-        # SPSA: simultaneous perturbation with Rademacher ±1 vector
-        Delta = (torch.randint(0, 2, (G, N), device=device) * 2 - 1).float()
+        obj_proxy = 0.0
 
-        V_plus  = torch.clamp(V + eps * Delta, min=0.01)
-        V_minus = torch.clamp(V - eps * Delta, min=0.01)
+        for _ in range(m_steps):
+            # One random time step, all groups simultaneously
+            k = torch.randint(0, N, (1,)).item()
+            Delta_k = (torch.randint(0, 2, (G,), device=device) * 2 - 1).float()
 
-        obj_plus  = _obj_of(V_plus)    # call 1
-        obj_minus = _obj_of(V_minus)   # call 2
+            V_plus  = V.clone(); V_plus[:, k]  = torch.clamp(V[:, k] + eps * Delta_k, min=0.01)
+            V_minus = V.clone(); V_minus[:, k] = torch.clamp(V[:, k] - eps * Delta_k, min=0.01)
 
-        # Central difference gradient estimate for all G×N entries
-        grad_est = (obj_plus - obj_minus) / (2.0 * eps) / Delta
+            obj_plus  = _obj_of(V_plus)
+            obj_minus = _obj_of(V_minus)
 
-        V = torch.clamp(V - lr * grad_est, min=0.01)
+            # Gradient only for time step k, across all G groups
+            grad_k = (obj_plus - obj_minus) / (2.0 * eps) / Delta_k  # (G,)
+            V[:, k] = torch.clamp(V[:, k] - lr * grad_k, min=0.01)
 
-        # Track best
-        obj = (obj_plus + obj_minus) / 2.0   # cheap proxy, no extra call
-        if obj < best_obj:
-            best_obj = obj
+            obj_proxy += (obj_plus + obj_minus) / 2.0
+
+        obj_proxy /= m_steps
+
+        if obj_proxy < best_obj:
+            best_obj = obj_proxy
             best_V = V.clone()
 
     return _build_path_2d(baseline, delta_x, best_V, gmap, N)
-
-
 # ═════════════════════════════════════════════════════════════════════════════
 # §7  JOINT* OPTIMISATION  (Algorithm 1 — Full Signal-Harvesting Solution)
 #

@@ -808,7 +808,7 @@ def _signal_harvesting_path_obj(
 
 def optimize_path_signal_harvesting(
     model, x, baseline, mu, N=50, G=16, patch_size=14,
-    n_iter=15, lr=0.08, lam=1.0,
+    n_iter=15, lr=0.01, lam=1.0,
     momentum=0.7, n_basis=5,
     early_stop_patience=10, early_stop_rtol=0.01, verbose=True,
 ):
@@ -816,23 +816,26 @@ def optimize_path_signal_harvesting(
     delta_x = x - baseline
     gmap = _build_spatial_groups(model, x, baseline, G, patch_size)
 
-    # Low-rank basis: smooth cosine functions over time
     basis = torch.stack([
         torch.cos(torch.arange(N, device=device, dtype=torch.float32) * j * 3.14159 / N)
         for j in range(n_basis)
     ])  # (n_basis, N)
 
-    # Coefficients: A (G, n_basis) — optimize this instead of V (G, N)
-    # Init: A[:,0] = 1.0 so V = 1 everywhere (straight line)
+    # Normalize each basis vector so perturbations have uniform scale
+    basis = basis / basis.norm(dim=1, keepdim=True)
+
     A = torch.zeros(G, n_basis, device=device)
-    A[:, 0] = 1.0
+    # Init so that A @ basis ≈ 1 everywhere
+    # basis[0] after normalization = cos(0)/‖cos(0)‖ = 1/√N for all entries
+    # So A[g,0] = √N gives V ≈ 1
+    A[:, 0] = basis[0].sum()  # = √N for normalized constant basis
 
     best_obj = float("inf")
     best_A = A.clone()
     vel_A = torch.zeros_like(A)
 
     def _V_from_A(Am):
-        return torch.clamp(Am @ basis, min=0.01)  # (G, N)
+        return torch.clamp(Am @ basis, min=0.01)
 
     def _obj_of(Am):
         V = _V_from_A(Am)
@@ -840,7 +843,7 @@ def optimize_path_signal_harvesting(
         d_v, df_v = _eval_path_batched(model, gp, N, device)
         return _signal_harvesting_path_obj(d_v, df_v, mu, lam=lam)
 
-    eps = 0.05
+    eps = 0.01
     stale_count = 0
     prev_best = float("inf")
     obj_history = []
@@ -854,7 +857,6 @@ def optimize_path_signal_harvesting(
             best_obj = obj
             best_A = A.clone()
 
-        # FD gradient: one random basis coefficient per group
         grad_A = torch.zeros_like(A)
         grad_norms_per_group = []
         for g in range(G):
@@ -865,7 +867,6 @@ def optimize_path_signal_harvesting(
             A[g, j] -= eps
             grad_norms_per_group.append(float(grad_A[g].norm()))
 
-        # SGD with momentum
         vel_A = momentum * vel_A + grad_A
         A = A - lr * vel_A
 
@@ -875,14 +876,14 @@ def optimize_path_signal_harvesting(
         if verbose:
             mean_g = sum(grad_norms_per_group) / len(grad_norms_per_group)
             max_g = max(grad_norms_per_group)
+            V_now = _V_from_A(A)
             print(f"  path_opt iter {it:2d}/{n_iter}  "
                   f"obj={obj:+.6f}  best={best_obj:+.6f}  "
                   f"|∇A|={float(grad_A.norm()):.4f}  "
                   f"|vel|={float(vel_A.norm()):.4f}  "
-                  f"mean/max_g={mean_g:.4f}/{max_g:.4f}  "
+                  f"V=[{float(V_now.min()):.2f},{float(V_now.max()):.2f}]  "
                   f"{'✓' if improved else ' '}  {dt:.2f}s")
 
-        # Early stopping
         if abs(prev_best) > 1e-12:
             rel_change = abs(prev_best - best_obj) / abs(prev_best)
         else:
@@ -894,7 +895,6 @@ def optimize_path_signal_harvesting(
             stale_count = 0
         prev_best = best_obj
 
-        # Restart from best halfway through patience
         if stale_count == early_stop_patience // 2 and not restarted:
             if verbose:
                 print(f"  🔄 Restart from best_A at iter {it}")

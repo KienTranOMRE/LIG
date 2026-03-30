@@ -601,23 +601,22 @@ def _build_spatial_groups(model, x, baseline, G=16, patch_size=14):
 #     return gamma
 def _build_path_2d(baseline, delta_x, V, group_map, N):
     """Path from grouped velocity schedule V (G, N)."""
-    G = V.shape[0]
     v_sums = V.sum(dim=1, keepdim=True).clamp(min=1e-12)
     W_norm = V / v_sums                                          # (G, N)
 
-    # Gather per-pixel weight for each time step: (N, 1, H, W)
+    # Gather per-pixel weight for each time step
     gmap_flat = group_map.flatten()                               # (H*W,)
-    weights = W_norm[:, :].T                                      # (N, G)
+    weights = W_norm.T                                            # (N, G)
     pixel_weights = weights[:, gmap_flat]                         # (N, H*W)
-    pixel_weights = pixel_weights.view(N, *baseline.shape[1:])    # (N, C, H, W)
 
-    # steps[k] = delta_x * pixel_weight[k]  →  cumsum gives the path
+    # Expand spatial weights to cover channels: (N, 1, H, W) → broadcast with (C, H, W)
+    _, C, H, W = baseline.shape
+    pixel_weights = pixel_weights.view(N, 1, H, W)               # (N, 1, H, W)
+
     steps = delta_x * pixel_weights                               # (N, C, H, W)
     cum = torch.cumsum(steps, dim=0)                              # (N, C, H, W)
 
-    # Prepend baseline, so gamma[k] = baseline + cum[k-1]
     gamma_stack = torch.cat([baseline, baseline + cum], dim=0)    # (N+1, C, H, W)
-
     return list(gamma_stack.unbind(0))
 
 def _eval_path_batched(model, gamma_pts, N, device):

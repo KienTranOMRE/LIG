@@ -506,8 +506,47 @@ def mu_optimized_ig(model: nn.Module, x: torch.Tensor,
 _group_cache: dict = {}   # memoised spatial groups
 
 
+# def _build_spatial_groups(model, x, baseline, G=16, patch_size=14):
+#     """Assign pixels to G groups by gradient importance.  Cached."""
+#     key = (x.data_ptr(), baseline.data_ptr(), G, patch_size)
+#     if key in _group_cache:
+#         return _group_cache[key]
+
+#     device = x.device
+#     _, C, H, W = x.shape
+#     delta_x = x - baseline
+#     mid = baseline + 0.5 * delta_x
+#     grad_mid = _gradient(model, mid)
+#     importance = (grad_mid * delta_x).abs().sum(dim=1, keepdim=True)
+
+#     n_rows = (H + patch_size - 1) // patch_size
+#     n_cols = (W + patch_size - 1) // patch_size
+#     n_patches = n_rows * n_cols
+
+#     patch_imp = torch.zeros(n_patches, device=device)
+#     patch_map = torch.zeros(1, 1, H, W, dtype=torch.long, device=device)
+
+#     for r in range(n_rows):
+#         for c in range(n_cols):
+#             pid = r * n_cols + c
+#             r0, r1 = r * patch_size, min((r + 1) * patch_size, H)
+#             c0, c1 = c * patch_size, min((c + 1) * patch_size, W)
+#             patch_map[0, 0, r0:r1, c0:c1] = pid
+#             patch_imp[pid] = importance[0, 0, r0:r1, c0:c1].mean()
+
+#     order = torch.argsort(patch_imp)
+#     p2g = torch.zeros(n_patches, dtype=torch.long, device=device)
+#     per_grp = n_patches // G
+#     for g in range(G):
+#         lo = g * per_grp
+#         hi = (g + 1) * per_grp if g < G - 1 else n_patches
+#         p2g[order[lo:hi]] = g
+
+#     gmap = p2g[patch_map.flatten()].view(1, 1, H, W)
+#     _group_cache[key] = gmap
+#     return gmap
+
 def _build_spatial_groups(model, x, baseline, G=16, patch_size=14):
-    """Assign pixels to G groups by gradient importance.  Cached."""
     key = (x.data_ptr(), baseline.data_ptr(), G, patch_size)
     if key in _group_cache:
         return _group_cache[key]
@@ -517,35 +556,36 @@ def _build_spatial_groups(model, x, baseline, G=16, patch_size=14):
     delta_x = x - baseline
     mid = baseline + 0.5 * delta_x
     grad_mid = _gradient(model, mid)
-    importance = (grad_mid * delta_x).abs().sum(dim=1, keepdim=True)
+    importance = (grad_mid * delta_x).abs().sum(dim=1, keepdim=True)  # (1,1,H,W)
 
     n_rows = (H + patch_size - 1) // patch_size
     n_cols = (W + patch_size - 1) // patch_size
     n_patches = n_rows * n_cols
 
-    patch_imp = torch.zeros(n_patches, device=device)
-    patch_map = torch.zeros(1, 1, H, W, dtype=torch.long, device=device)
+    # patch_map: (1,1,H,W) — identical to original pid = r * n_cols + c
+    row_ids = torch.arange(H, device=device) // patch_size
+    col_ids = torch.arange(W, device=device) // patch_size
+    patch_map = (row_ids[:, None] * n_cols + col_ids[None, :]).unsqueeze(0).unsqueeze(0)
 
-    for r in range(n_rows):
-        for c in range(n_cols):
-            pid = r * n_cols + c
-            r0, r1 = r * patch_size, min((r + 1) * patch_size, H)
-            c0, c1 = c * patch_size, min((c + 1) * patch_size, W)
-            patch_map[0, 0, r0:r1, c0:c1] = pid
-            patch_imp[pid] = importance[0, 0, r0:r1, c0:c1].mean()
+    # patch_imp: mean over actual pixels per patch (no zero-padding dilution)
+    flat_pids = patch_map.flatten()                                    # (H*W,)
+    flat_imp = importance.flatten()                                    # (H*W,)
+    patch_sum = torch.zeros(n_patches, device=device).scatter_add_(0, flat_pids, flat_imp)
+    patch_cnt = torch.zeros(n_patches, device=device).scatter_add_(
+        0, flat_pids, torch.ones_like(flat_imp)
+    )
+    patch_imp = patch_sum / patch_cnt.clamp(min=1)
 
+    # group assignment: rank // per_grp, last group absorbs remainder
     order = torch.argsort(patch_imp)
-    p2g = torch.zeros(n_patches, dtype=torch.long, device=device)
+    rank = torch.empty_like(order)
+    rank[order] = torch.arange(n_patches, device=device)
     per_grp = n_patches // G
-    for g in range(G):
-        lo = g * per_grp
-        hi = (g + 1) * per_grp if g < G - 1 else n_patches
-        p2g[order[lo:hi]] = g
+    p2g = torch.clamp(rank // per_grp, max=G - 1)
 
     gmap = p2g[patch_map.flatten()].view(1, 1, H, W)
     _group_cache[key] = gmap
     return gmap
-
 
 def _build_path_2d(baseline, delta_x, V, group_map, N):
     """Path from grouped velocity schedule V (G, N)."""

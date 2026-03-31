@@ -1,95 +1,136 @@
-# LAM — Least Action Movement for Integrated Gradients
+# μ-Optimized Integrated Gradients
 
-A unified variational framework that reveals all Integrated Gradients (IG) variants as approximate solutions to the same conservation law: **the step fidelity ratio must be constant along the interpolation path**.
+**Optimizing Weights for Discretized Integrated Gradients**
 
-This conservation law is the attribution analogue of **Snell's law in optics**, where the Hessian of the model plays the role of refractive index.
+A direct optimization framework for finding optimal quadrature weights in discrete Integrated Gradients. The standard IG implementation uses uniform weights (1/N) that treat every step equally, regardless of whether the gradient approximation is faithful at that step. We formulate the problem of finding optimal weights μ ∈ P_N that minimize the variance of step fidelities under an L2 regularization penalty.
 
-## The Idea
+**Key Result:** μ-Optimized IG requires **zero additional model evaluations** beyond standard IG and consistently improves the conservation quality metric Q.
 
-Standard IG integrates gradients along a straight line from a baseline to the input. In practice, this path traverses regions where the model's output is flat (wasting interpolation budget) and regions of sharp nonlinearity (where the linear approximation breaks down). Two existing methods address this differently:
+## The Problem
 
-- **IDGI** reweights *which steps to trust* (the measure μ)
-- **Guided IG** changes *where to evaluate gradients* (the path γ)
-
-LAM shows both are optimising the same objective — minimising the weighted variance of step fidelity:
+Standard Integrated Gradients with N steps computes:
 
 ```
-min_{γ,μ}  Var_ν(φ)  =  Σ_k ν_k (φ_k − φ̄_ν)²
+A_i = (1/N) Σ_k ∇f(γ_k) · (x_i − x'_i)
 ```
 
-where φ_k = d_k / Δf_k is the ratio of gradient-predicted to actual output change at step k.
+The uniform weight 1/N treats every step equally. However, at finite N, the linear approximation `∇f(γ_k) · Δγ_k ≈ Δf_k` is not equally accurate everywhere:
 
-## Methods
+- Some steps are **highly faithful**: the gradient predicts the output change well (φ_k ≈ 1)
+- Other steps are **poor**: the output changes nonlinearly (φ_k varies wildly)
 
-| Method | Path γ | Measure μ | What it optimises |
-|--------|--------|-----------|-------------------|
-| Standard IG | straight line | uniform | nothing |
-| IDGI | straight line | μ_k ∝ \|Δf_k\| | μ heuristic |
-| Guided IG | low-grad-first | uniform | γ heuristic |
-| μ-LAM (ours) | straight line | optimal | min CV²(φ) over μ |
-| **Joint-LAM  (ours)** | **optimal** | **optimal** | **alternating min over (γ, μ)** |
+The uniform weighting averages over all steps indiscriminately, mixing faithful and unfaithful contributions.
+
+## The Solution
+
+Find weights μ ∈ P_N that minimize the variance of step fidelities:
+
+```
+min_{μ∈P_N}  Var_ν(φ) + (τ/2) ||μ||²₂
+```
+
+where:
+- **Var_ν(φ)** — fidelity variance: measures how inconsistently gradients approximate output changes
+- **||μ||²₂** — L2 penalty: prevents degenerate weight collapse to a single step
+- **τ** — regularization parameter balancing consistency and smoothness (typically 0.005–0.01)
+
+### Step Fidelity
+
+The **step fidelity** at step k is the ratio:
+
+```
+φ_k = d_k / Δf_k
+```
+
+where:
+- `d_k = ∇f(γ_k) · Δγ_k` — gradient-predicted output change
+- `Δf_k = f(γ_{k+1}) − f(γ_k)` — actual output change
+
+When φ_k = 1, the first-order Taylor approximation perfectly predicts the actual change.
+
+**Conservation property:** If φ_k = c (constant) for all steps, the weighted attribution is perfectly consistent.
+
+## Methods Compared
+
+| Method | Weights μ | What it optimizes |
+|--------|-----------|-------------------|
+| Standard IG | uniform (1/N) | nothing |
+| IDGI | μ_k ∝ \|Δf_k\| | signal coverage (heuristic) |
+| **μ-Optimized** | **optimal** | **min Var_ν(φ) + (τ/2)‖μ‖²** |
+
+### Computational Cost
+
+**Critical observation:** All three methods require the same model evaluations.
+
+| Method | Forward passes | Backward passes | Extra arithmetic |
+|--------|----------------|-----------------|------------------|
+| Standard IG | N + 1 | N | — |
+| IDGI | N + 1 | N | O(N) |
+| **μ-Optimized** | **N + 1** | **N** | **O(NT)** |
+
+The μ-optimization loop adds **zero additional model evaluations**. The O(NT) arithmetic cost is negligible compared to the O(N) neural network forward/backward passes.
 
 ## Results
 
 ResNet-50 on ImageNet, N = 50 interpolation steps, zero baseline:
 
 ```
-Method                Var_ν      CV²        𝒬     Time
-────────────────────────────────────────────────────────
-IG                 0.015749   0.0278   0.9730     0.1s
-IDGI               0.005221   0.0100   0.9901     0.1s
-Guided IG          0.012081   0.0403   0.9612     0.4s
-μ-LAM              0.000254   0.0005   0.9995     0.2s
-Joint-LAM          0.000222   0.0004   0.9996    38.9s
+Method            Var_ν      CV²        𝒬       Time
+──────────────────────────────────────────────────────
+IG              0.015749   0.0278   0.9730      0.1s
+IDGI            0.005221   0.0100   0.9901      0.1s
+μ-Optimized     0.000254   0.0005   0.9995      0.2s
 ```
 
-𝒬 = 1/(1 + CV²) is the quality score (1 = perfect conservation). μ-Optimised achieves 𝒬 > 0.999 at zero additional cost over standard IG. Joint pushes further by also optimising the path.
+**𝒬 = 1/(1 + CV²)** is the quality score (1 = perfect conservation).
+
+μ-Optimized achieves **𝒬 > 0.999** at negligible computational cost over standard IG.
 
 ## Files
 
 ```
-LAM.py         Main framework — all five IG methods + visualisation
-utilss.py      Metrics (Var_ν, CV², 𝒬), insertion/deletion evaluation,
-               region-based evaluation, plotting utilities
+u_optimize.py    μ-Optimization framework — three IG methods
+lam.py          Base IG implementations and utilities
+utilss.py       Metrics (Var_ν, CV², 𝒬), evaluation, plotting
 ```
 
 ## Quick Start
 
 ```bash
-# Basic run (straight-line init, all 5 methods)
-python LAM.py
+# Basic run (all 3 methods: IG, IDGI, μ-Optimized)
+python u_optimize.py
 
 # With attribution heatmaps and fidelity diagnostics
-python LAM.py --viz --viz-fidelity
-
-# Initialise Joint from Guided IG path
-python LAM.py --guided-init
+python u_optimize.py --viz --viz-fidelity
 
 # Export results to JSON
-python LAM.py --json results.json
+python u_optimize.py --json results.json
+
+# Adjust regularization parameter τ
+python u_optimize.py --tau 0.005
 
 # Fewer steps (faster)
-python LAM.py --steps 30
+python u_optimize.py --steps 30
 
 # Force CPU
-python LAM.py --device cpu
+python u_optimize.py --device cpu
 ```
 
 ## Evaluation
 
 ```bash
 # Pixel-level insertion/deletion (Petsiuk et al., 2018)
-python LAM.py --insdel --viz-insdel
+python u_optimize.py --insdel --viz-insdel
 
 # Region-based insertion/deletion (SIC-style, uses SLIC superpixels)
-python LAM.py --region-insdel --viz-region-insdel
+python u_optimize.py --region-insdel --viz-region-insdel
 
 # Region-based with grid patches instead of SLIC
-python LAM.py --region-insdel --no-slic --patch-size 16
+python u_optimize.py --region-insdel --no-slic --patch-size 16
 
 # Everything
-python LAM.py --viz --viz-fidelity --insdel --viz-insdel \
-              --region-insdel --viz-region-insdel --guided-init
+python u_optimize.py --viz --viz-fidelity --insdel --viz-insdel \
+                     --region-insdel --viz-region-insdel
 ```
 
 ## CLI Reference
@@ -97,9 +138,9 @@ python LAM.py --viz --viz-fidelity --insdel --viz-insdel \
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--steps N` | Interpolation steps | 50 |
+| `--tau F` | L2 regularization parameter τ | 0.01 |
 | `--device DEVICE` | Force cuda/cpu | auto |
 | `--min-conf F` | Minimum classification confidence | 0.70 |
-| `--guided-init` | Init Joint from Guided IG path | off (straight line) |
 | `--viz` | Generate attribution heatmaps | off |
 | `--viz-path PATH` | Heatmap output path | attribution_heatmaps.png |
 | `--viz-fidelity` | Step fidelity diagnostic plot | off |
@@ -111,41 +152,151 @@ python LAM.py --viz --viz-fidelity --insdel --viz-insdel \
 | `--patch-size N` | Grid patch size for regions | 14 |
 | `--no-slic` | Use grid patches instead of SLIC | off (SLIC preferred) |
 | `--json PATH` | Export results to JSON | off |
+| `--seed N` | Random seed for reproducibility | 42 |
+| `--skip N` | Skip N images in dataset | 0 |
 
 ## Quality Metrics
 
-Three related metrics, all derived from the step fidelity φ_k = d_k / Δf_k:
+### Effective Measure
 
-- **Var_ν(φ)** — weighted variance of fidelity under effective measure ν_k ∝ μ_k Δf_k². The primary objective for μ-optimisation.
-- **CV²(φ)** = Var_ν(φ) / φ̄² — scale-free coefficient of variation. Used as the optimisation target (prevents degenerate solutions where φ̄ → 0).
-- **𝒬** = 1/(1 + CV²) — quality score in [0, 1]. Equals the squared cosine similarity between d and Δf under the μ-weighted inner product. 𝒬 = 1 ⟺ perfect conservation.
+Not all steps matter equally. Steps with tiny |Δf_k| carry negligible attribution signal. The **effective measure** captures this:
 
-## Physical Analogy
+```
+ν_k = (μ_k Δf²_k) / Σ_j μ_j Δf²_j
+```
 
-The conservation law φ_k = const is structurally identical to Snell's law in optics:
+Steps where output is flat (Δf_k ≈ 0) have ν_k ≈ 0 regardless of μ_k.
 
-| Concept | Optics (Fermat) | Attribution (LAM) |
-|---------|-----------------|-------------------|
-| Path | Light ray γ(t) | Interpolation path γ(t) |
-| Endpoints | Source, detector | Baseline x', input x |
-| Local cost | Refractive index n(x) | Hessian ‖H_f(x)‖ |
-| Conservation | n sin θ = const | ρ(t) = const |
-| Bending | At media interfaces | At flat/curved transitions of f |
+### Fidelity Variance
 
-The optimal attribution path bends away from regions of high curvature of f, just as light bends away from optically dense regions.
+The fidelity variance under the effective measure:
+
+```
+φ̄_ν = Σ_k ν_k φ_k
+Var_ν(φ) = Σ_k ν_k (φ_k − φ̄_ν)²
+```
+
+### Quality Metric Q
+
+The attribution quality metric:
+
+```
+Q = 1 / (1 + CV²_ν(φ))
+```
+
+where `CV²_ν(φ) = Var_ν(φ) / φ̄²_ν` is the squared coefficient of variation.
+
+**Properties:**
+- Q ∈ [0, 1]
+- Q = 1 ⟺ φ_k = const for all steps with ν_k > 0 (perfect conservation)
+- Equivalent form: `Q = (Σ μ_k d_k Δf_k)² / [(Σ μ_k d²_k)(Σ μ_k Δf²_k)]`
+
+This is a squared weighted correlation between d_k and Δf_k under μ (Cauchy-Schwarz ratio).
+
+## The Optimization Algorithm
+
+### Objective
+
+```
+min_{μ∈P_N}  -Q(μ) + (τ/2) ||μ||²₂
+```
+
+Maximizing Q(μ) is equivalent to minimizing Var_ν(φ) when the mean φ̄_ν varies slowly.
+
+### Gradient
+
+Define:
+```
+P = Σ_k μ_k d_k Δf_k
+D = Σ_k μ_k d²_k
+F = Σ_k μ_k Δf²_k
+```
+
+Then `Q(μ) = P² / (DF)` and:
+
+```
+∂Q/∂μ_k = (P/DF) [2d_k Δf_k − (P/D)d²_k − (P/F)Δf²_k]
+```
+
+The L2 penalty contributes: `∂/∂μ_k [(τ/2)||μ||²] = τμ_k`
+
+### Projected Gradient Descent
+
+1. Precompute: `a_k = d_k Δf_k`, `b_k = d²_k`, `c_k = Δf²_k`
+2. Initialize: `μ_k = 1/N` for all k
+3. For t = 1, ..., T:
+   - Compute P, D, F
+   - Compute gradient: `g_k = -(P/DF)[2a_k − (P/D)b_k − (P/F)c_k] + τμ_k`
+   - Update: `μ ← μ − η·g`
+   - Project onto simplex: `μ ← Proj_{P_N}(μ)`
+
+**Cost:** O(N) arithmetic per iteration, operates entirely on precomputed vectors d_k, Δf_k.
+
+## Why L2 Regularization?
+
+Without the L2 penalty (τ = 0), minimizing Var_ν(φ) alone admits **degenerate solutions**:
+
+**Example:** Consider N = 100 steps where:
+- Steps 40–60: transition region (|Δf_k| ≫ 0, φ_k varies)
+- Other steps: flat region (|Δf_k| ≈ 0)
+
+Minimizing Var_ν(φ) alone can yield μ concentrated on flat steps, where φ_k is trivially near-constant because both d_k and Δf_k are near zero. The resulting Q ≈ 1 is **vacuous**: attributions computed from steps where f doesn't change.
+
+The L2 penalty prevents this by penalizing extreme concentration:
+- **||μ||²₂** = Σ μ²_k (Herfindahl index of concentration)
+- Minimized by uniform distribution: ||μ||²₂ = 1/N
+- Maximized by Dirac spike: ||μ||²₂ = 1
+
+With τ > 0, concentrating μ on a small number of flat steps incurs high ||μ||²₂ cost, forcing the optimizer to spread weight—including over informative transition regions.
+
+### Role of τ
+
+The parameter τ controls the trade-off:
+
+- **τ → 0⁺**: regularization vanishes, μ* minimizes Var_ν(φ) alone (risk of degeneracy)
+- **τ → ∞**: L2 penalty dominates, μ* → 1/N (recovers standard IG)
+- **Intermediate τ**: balances consistency and spread. Empirically, **τ ∈ [0.005, 0.01]** works well (allows 5–15 steps to carry most weight when N = 50)
+
+## Relationship to IDGI
+
+**IDGI** (Integrated Directional Gradients) uses the closed-form weights `μ_k ∝ |Δf_k|`. This is **not** a solution to our objective, which contains no signal-coverage term. The two approaches are complementary:
+
+- **IDGI**: assigns weight based on *how much the output changes* at each step (|Δf_k|). Closed-form heuristic, no optimization required. Targets signal coverage.
+
+- **μ-Optimized**: assigns weight to minimize *how inconsistently the gradient approximation works* across steps (Var_ν(φ)). Requires iterative optimization but directly targets conservation quality metric Q.
+
+In practice, μ-Optimized weights often resemble IDGI weights (both upweight transition-region steps), but for different reasons:
+- IDGI upweights where |Δf_k| is large (heuristic)
+- μ-Optimized upweights where φ_k varies most, to equalize fidelities (principled)
+
+**Combination:** You can initialize the optimizer with IDGI weights instead of uniform weights, often accelerating convergence.
+
+## Completeness Axiom
+
+The completeness axiom requires `Σ_i A_i = f(x) − f(x')`.
+
+For arbitrary weights μ ∈ P_N, completeness does not hold exactly (it holds only for μ_k = 1/N as N → ∞). We restore it by final rescaling:
+
+```
+A_i ← A_i · [f(x) − f(x')] / Σ_j A_j
+```
+
+This is the same rescaling used by IDGI and other weighted IG variants.
+
+**Note:** The quality metric Q is **orthogonal to completeness**—it measures how faithfully the attributions decompose the output change, not whether they sum to the correct total.
 
 ## Requirements
 
 ```
 torch >= 2.0
 torchvision
-matplotlib  (for --viz flags)
-scikit-image  (optional, for SLIC superpixels in --region-insdel)
+matplotlib         (for --viz flags)
+scikit-image       (optional, for SLIC superpixels in --region-insdel)
 ```
 
 ## References
 
-- Sundararajan, Taly, Yan. "Axiomatic Attribution for Deep Networks." ICML 2017.
-- Sikdar, Bhatt, Heese. "Integrated Directional Gradients." ACL 2021.
-- Kapishnikov, Bolukbasi, Viégas, Terry. "Guided Integrated Gradients." CVPR 2021.
-- Petsiuk, Das, Saenko. "RISE: Randomized Input Sampling for Explanation." BMVC 2018.
+- Sundararajan, M., Taly, A., and Yan, Q. "Axiomatic Attribution for Deep Networks." ICML 2017.
+- Sikdar, S., Bhatt, P., and Heese, R. "Integrated Directional Gradients: Feature Interaction Attribution for Neural NLP Models." ACL 2021.
+- Petsiuk, V., Das, A., and Saenko, K. "RISE: Randomized Input Sampling for Explanation of Black-box Models." BMVC 2018.
+- Duchi, J., Shalev-Shwartz, S., Singer, Y., and Chandra, T. "Efficient Projections onto the ℓ1-ball for Learning in High Dimensions." ICML 2008.

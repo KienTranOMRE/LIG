@@ -20,7 +20,7 @@ import os
 import time
 from dataclasses import dataclass, field, asdict
 from typing import Optional
-
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -679,7 +679,6 @@ def load_image(backbone: nn.Module, device: torch.device, min_conf: float = 0.70
             continue
         try:
             from PIL import Image
-            import random
             jpegs = sorted([f for f in os.listdir(sample_dir)
                             if f.lower().endswith(('.jpeg', '.jpg', '.png'))])
             random.shuffle(jpegs)
